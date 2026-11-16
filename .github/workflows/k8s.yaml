@@ -1,0 +1,110 @@
+name: k8s-cluster
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: apply or destroy
+        type: choice
+        options: [apply, destroy]
+        default: apply
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+jobs:
+  cluster:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create AWS profile
+        run: |
+          aws configure set aws_access_key_id "$AWS_ACCESS_KEY_ID" --profile user-terraform
+          aws configure set aws_secret_access_key "$AWS_SECRET_ACCESS_KEY" --profile user-terraform
+
+      - name: Restore Terraform state
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RUN=$(gh api "repos/${{ github.repository }}/actions/artifacts?name=tfstate&per_page=20" \
+            --jq '[.artifacts[] | select(.expired == false)][0].workflow_run.id')
+          if [ -n "$RUN" ] && [ "$RUN" != "null" ]; then
+            gh run download "$RUN" --name tfstate --dir terraform
+          else
+            echo "No previous state found"
+          fi
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform init and validate
+        working-directory: terraform
+        run: |
+          terraform init
+          terraform validate
+
+      - name: Terraform destroy
+        if: inputs.action == 'destroy'
+        working-directory: terraform
+        run: terraform destroy -auto-approve
+
+      - name: Terraform apply
+        if: inputs.action == 'apply'
+        working-directory: terraform
+        run: |
+          RUNNER_IP=$(curl -s https://api.ipify.org)
+          terraform apply -auto-approve -var "runner_ip=${RUNNER_IP}/32"
+
+      - name: Save Terraform state
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfstate
+          path: terraform/terraform.tfstate
+          retention-days: 90
+          if-no-files-found: ignore
+
+      - name: Install SSH key
+        if: inputs.action == 'apply'
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/key-mo.pem
+          chmod 400 ~/key-mo.pem
+
+      - name: Fill IPs in inventory
+        if: inputs.action == 'apply'
+        working-directory: terraform
+        run: |
+          IPS=$(terraform output -json public_ips)
+          sed -i \
+            -e "s/MASTER_PUBLIC_IP/$(echo "$IPS" | jq -r .master)/" \
+            -e "s/MASTER_PRIVATE_IP/$(terraform output -raw master_private_ip)/" \
+            -e "s/WORKER1_PUBLIC_IP/$(echo "$IPS" | jq -r .worker1)/" \
+            -e "s/WORKER2_PUBLIC_IP/$(echo "$IPS" | jq -r .worker2)/" \
+            ../ansible/inventory.yaml
+
+      - name: Install Ansible
+        if: inputs.action == 'apply'
+        run: pip install ansible
+
+      - name: Wait for SSH
+        if: inputs.action == 'apply'
+        working-directory: ansible
+        run: |
+          for i in $(seq 1 30); do
+            ansible all -m ping && break
+            sleep 10
+          done
+
+      - name: Run playbook
+        if: inputs.action == 'apply'
+        working-directory: ansible
+        run: ansible-playbook playbook.yaml
