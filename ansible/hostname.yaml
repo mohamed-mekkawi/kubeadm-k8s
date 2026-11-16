@@ -1,0 +1,154 @@
+- name: Prepare all nodes
+  hosts: all
+  become: true
+  vars:
+    k8s_version: v1.35   # غيّرها لأي إصدار متاح على pkgs.k8s.io
+  tasks:
+    - name: Set hostname
+      ansible.builtin.hostname:
+        name: "{{ inventory_hostname }}"
+
+    - name: Disable swap now
+      ansible.builtin.command: swapoff -a
+      changed_when: false
+
+    - name: Disable swap permanently
+      ansible.builtin.replace:
+        path: /etc/fstab
+        regexp: '^([^#].*\sswap\s.*)$'
+        replace: '# \1'
+
+    - name: Load kernel modules (now + on boot)
+      community.general.modprobe:
+        name: "{{ item }}"
+        persistent: present
+      loop: [overlay, br_netfilter]
+
+    - name: Kernel network settings
+      ansible.posix.sysctl:
+        name: "{{ item }}"
+        value: "1"
+        sysctl_file: /etc/sysctl.d/99-kubernetes.conf
+        reload: true
+      loop:
+        - net.ipv4.ip_forward
+        - net.bridge.bridge-nf-call-iptables
+        - net.bridge.bridge-nf-call-ip6tables
+
+    - name: Install containerd
+      ansible.builtin.apt:
+        name: containerd
+        update_cache: true
+
+    - name: Generate containerd config with SystemdCgroup=true
+      ansible.builtin.shell: |
+        mkdir -p /etc/containerd
+        containerd config default | sed 's/SystemdCgroup = false/SystemdCgroup = true/' > /etc/containerd/config.toml
+      changed_when: false
+
+    - name: Restart containerd
+      ansible.builtin.systemd:
+        name: containerd
+        state: restarted
+        enabled: true
+
+    - name: Keyrings dir
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: "0755"
+
+    - name: Kubernetes apt key
+      ansible.builtin.get_url:
+        url: "https://pkgs.k8s.io/core:/stable:/{{ k8s_version }}/deb/Release.key"
+        dest: /etc/apt/keyrings/kubernetes.asc
+        mode: "0644"
+
+    - name: Kubernetes apt repo
+      ansible.builtin.apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/kubernetes.asc] https://pkgs.k8s.io/core:/stable:/{{ k8s_version }}/deb/ /"
+        filename: kubernetes
+
+    - name: Install kubelet, kubeadm, kubectl
+      ansible.builtin.apt:
+        name: [kubelet, kubeadm, kubectl]
+        update_cache: true
+
+    - name: Hold kube packages
+      ansible.builtin.dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop: [kubelet, kubeadm, kubectl]
+
+- name: Control plane
+  hosts: master
+  become: true
+  vars:
+    calico_version: v3.33.0   # نفس الإصدار اللي في السكريبت، اتأكد إن الرابط شغال
+  tasks:
+    - name: kubeadm init
+      ansible.builtin.command: >
+        kubeadm init
+        --apiserver-advertise-address={{ private_ip }}
+        --apiserver-cert-extra-sans={{ ansible_host }}
+        --pod-network-cidr=192.168.0.0/16
+        --cri-socket=unix:///run/containerd/containerd.sock
+      args:
+        creates: /etc/kubernetes/admin.conf
+
+    - name: Create .kube dir for ubuntu
+      ansible.builtin.file:
+        path: /home/ubuntu/.kube
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: "0755"
+
+    - name: Copy admin.conf to ubuntu user
+      ansible.builtin.copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /home/ubuntu/.kube/config
+        remote_src: true
+        owner: ubuntu
+        group: ubuntu
+        mode: "0600"
+
+    - name: Install Calico CNI
+      ansible.builtin.command: >
+        kubectl apply -f
+        https://raw.githubusercontent.com/projectcalico/calico/{{ calico_version }}/manifests/calico.yaml
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      changed_when: false
+
+    - name: Generate join command
+      ansible.builtin.command: kubeadm token create --print-join-command
+      register: join_cmd
+      changed_when: false
+
+- name: Join workers
+  hosts: workers
+  become: true
+  tasks:
+    - name: kubeadm join
+      ansible.builtin.command: "{{ hostvars[groups['master'][0]].join_cmd.stdout }}"
+      args:
+        creates: /etc/kubernetes/kubelet.conf
+
+- name: Wait until all nodes are Ready
+  hosts: master
+  become: true
+  tasks:
+    - name: kubectl get nodes
+      ansible.builtin.command: kubectl get nodes
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: nodes
+      until: nodes.stdout_lines | select('search', ' NotReady') | list | length == 0
+      retries: 30
+      delay: 10
+      changed_when: false
+
+    - name: Show nodes
+      ansible.builtin.debug:
+        var: nodes.stdout_lines
