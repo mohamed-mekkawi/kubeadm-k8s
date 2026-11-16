@@ -38,7 +38,7 @@ resource "aws_security_group" "k8s" {
       from_port   = ingress.value[0]
       to_port     = ingress.value[1]
       protocol    = "tcp"
-      cidr_blocks = [var.my_ip]
+      cidr_blocks = compact([var.my_ip, var.runner_ip])
     }
   }
 
