@@ -15,7 +15,6 @@ on:
 
 permissions:
   contents: read
-  actions: write
 
 concurrency:
   group: terraform-k8s-cluster
@@ -31,17 +30,17 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1. Checkout repository
+      # 1. Checkout
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 2. Install Terraform
+      # 2. Setup Terraform
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_wrapper: false
 
-      # 3. Configure AWS CLI
+      # 3. Configure AWS
       - name: Configure AWS
         run: |
           aws configure set aws_access_key_id "$AWS_ACCESS_KEY_ID" \
@@ -53,53 +52,34 @@ jobs:
           aws configure set region "$AWS_DEFAULT_REGION" \
             --profile user-terraform
 
-      # 4. Restore Terraform State
-      - name: Restore Terraform State
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir -p terraform
-
-          RUN=$(gh api \
-            "repos/${{ github.repository }}/actions/artifacts?name=tfstate&per_page=100" \
-            --jq '[.artifacts[] | select(.expired == false) |
-            select(.workflow_run.conclusion == "success")] |
-            sort_by(.created_at) | last | .workflow_run.id // empty')
-
-          if [ -n "$RUN" ]; then
-            echo "Restoring state from workflow run: $RUN"
-
-            gh run download "$RUN" \
-              --name tfstate \
-              --dir terraform
-
-          else
-            echo "ERROR: No previous Terraform state artifact found."
-            echo "Refusing to continue to avoid losing infrastructure tracking."
-            exit 1
-          fi
-
-          if [ ! -s terraform/terraform.tfstate ]; then
-            echo "ERROR: Terraform state is missing or empty."
-            exit 1
-          fi
-
-          echo "Terraform state restored successfully."
-
-      # 5. Terraform Init and Validate
-      - name: Terraform Init and Validate
+      # 4. Terraform Init
+      - name: Terraform Init
         working-directory: terraform
         run: |
           terraform init -input=false
           terraform validate
 
-      # 6. Terraform State List
-      - name: Check Terraform State
+      # 5. Verify S3 Remote State
+      - name: Verify Terraform State
         working-directory: terraform
         run: |
+          terraform state pull > "$RUNNER_TEMP/terraform.tfstate"
+
+          RESOURCE_COUNT=$(jq \
+            '[.resources[]?.instances[]?] | length' \
+            "$RUNNER_TEMP/terraform.tfstate")
+
+          echo "Resources found in S3 state: $RESOURCE_COUNT"
+
+          if [ "$RESOURCE_COUNT" -eq 0 ]; then
+            echo "ERROR: Remote state has no managed resources."
+            echo "Refusing to continue to protect existing AWS infrastructure."
+            exit 1
+          fi
+
           terraform state list
 
-      # 7. Terraform Apply
+      # 6. Terraform Apply
       - name: Terraform Apply
         if: inputs.action == 'apply'
         working-directory: terraform
@@ -111,7 +91,7 @@ jobs:
             -auto-approve \
             -var "runner_ip=${RUNNER_IP}/32"
 
-      # 8. Terraform Destroy
+      # 7. Terraform Destroy
       - name: Terraform Destroy
         if: inputs.action == 'destroy'
         working-directory: terraform
@@ -122,32 +102,7 @@ jobs:
             -input=false \
             -auto-approve
 
-      # 9. Save State after successful Apply
-      - name: Save Terraform State
-        if: inputs.action == 'apply' && success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: tfstate
-          path: terraform/terraform.tfstate
-          retention-days: 90
-          if-no-files-found: error
-
-      # 10. Delete old State artifacts after successful Destroy
-      - name: Delete State Artifacts
-        if: inputs.action == 'destroy' && success()
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          ARTIFACTS=$(gh api \
-            "repos/${{ github.repository }}/actions/artifacts?name=tfstate&per_page=100")
-
-          echo "$ARTIFACTS" | jq -r '.artifacts[].id' |
-          while read ID; do
-            gh api -X DELETE \
-              "repos/${{ github.repository }}/actions/artifacts/$ID"
-          done
-
-      # 11. Install SSH Key
+      # 8. Install SSH Key
       - name: Install SSH Key
         if: inputs.action == 'apply'
         env:
@@ -156,7 +111,7 @@ jobs:
           printf '%s\n' "$SSH_PRIVATE_KEY" > ~/key-mo.pem
           chmod 400 ~/key-mo.pem
 
-      # 12. Fill Ansible Inventory
+      # 9. Fill Ansible Inventory
       - name: Fill Ansible Inventory
         if: inputs.action == 'apply'
         working-directory: terraform
@@ -175,13 +130,13 @@ jobs:
             -e "s/WORKER2_PUBLIC_IP/$WORKER2_PUBLIC/g" \
             ../ansible/inventory.yaml
 
-      # 13. Install Ansible
+      # 10. Install Ansible
       - name: Install Ansible
         if: inputs.action == 'apply'
         run: |
           pip install ansible
 
-      # 14. Wait for SSH
+      # 11. Wait for SSH
       - name: Wait for SSH
         if: inputs.action == 'apply'
         working-directory: ansible
@@ -199,7 +154,7 @@ jobs:
           echo "ERROR: SSH connection failed."
           exit 1
 
-      # 15. Configure Kubernetes Cluster
+      # 12. Configure Kubernetes
       - name: Run Ansible Playbook
         if: inputs.action == 'apply'
         working-directory: ansible
