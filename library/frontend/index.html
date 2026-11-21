@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Library</title>
+<style>
+  *{box-sizing:border-box}
+  body{font-family:system-ui,sans-serif;background:#f1f5f9;margin:0;color:#0f172a}
+  header{background:#0f4c5c;color:#fff;padding:14px 24px;display:flex;justify-content:space-between;align-items:center}
+  header h1{margin:0;font-size:20px}
+  header button{background:#fff;color:#0f4c5c;border:0;padding:8px 14px;border-radius:8px;cursor:pointer;margin-left:8px}
+  .wrap{padding:24px;max-width:1100px;margin:auto}
+  .card{background:#fff;padding:28px;border-radius:12px;width:340px;margin:60px auto;box-shadow:0 4px 16px #0001}
+  .card h2{margin-top:0;color:#0f4c5c}
+  input{width:100%;padding:10px;margin:6px 0 12px;border:1px solid #cbd5e1;border-radius:8px}
+  .btn{width:100%;padding:10px;background:#0f4c5c;color:#fff;border:0;border-radius:8px;cursor:pointer;font-size:15px}
+  .link{background:none;color:#0f4c5c;margin-top:10px;text-decoration:underline;border:0;cursor:pointer;width:100%}
+  .error{background:#fee2e2;color:#b91c1c;padding:8px;border-radius:8px;margin-bottom:10px;display:none}
+  .toast{background:#dcfce7;color:#166534;padding:10px;border-radius:8px;margin-bottom:14px;display:none}
+  .hidden{display:none}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:18px}
+  .book{background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 2px 10px #0001;display:flex;flex-direction:column}
+  .cover{height:150px;display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700;padding:12px;text-align:center}
+  .cover img{width:100%;height:100%;object-fit:cover}
+  .info{padding:14px;flex:1}
+  .info h3{margin:0 0 4px;font-size:16px}
+  .muted{color:#64748b;font-size:14px;margin:2px 0}
+  .price{font-weight:700;color:#0f4c5c;font-size:18px;margin:8px 0}
+  .badge{display:inline-block;padding:2px 8px;border-radius:99px;font-size:12px}
+  .yes{background:#dcfce7;color:#166534}.no{background:#fee2e2;color:#b91c1c}
+  .actions{display:flex;gap:8px;padding:0 14px 14px}
+  .actions button{flex:1;padding:9px;border:0;border-radius:8px;cursor:pointer;color:#fff}
+  .buy{background:#0f4c5c}.borrow{background:#2f855a}
+  .actions button:disabled{background:#cbd5e1;cursor:not-allowed}
+</style>
+</head>
+<body>
+
+<div id="authView" class="hidden">
+  <div class="card">
+    <h2 id="title">Login</h2>
+    <div id="error" class="error"></div>
+    <div id="nameWrap" class="hidden"><label>Name</label><input id="name"></div>
+    <label>Email</label><input id="email" type="email">
+    <label>Password</label><input id="password" type="password">
+    <button class="btn" id="submit">Login</button>
+    <button class="link" id="toggle">No account? Register</button>
+  </div>
+</div>
+
+<div id="homeView" class="hidden">
+  <header>
+    <h1>📚 Library</h1>
+    <div><span id="who"></span><button id="logout">Logout</button></div>
+  </header>
+  <div class="wrap">
+    <div id="toast" class="toast"></div>
+    <div id="alert" class="error"></div>
+    <div id="books" class="grid"></div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const token = () => localStorage.getItem("token");
+let mode = "login";
+const colors = ["#0f4c5c","#9a3412","#6b21a8","#166534","#9f1239","#1e40af","#854d0e","#334155"];
+
+function showError(m){ $("error").textContent = m; $("error").style.display = m ? "block" : "none"; }
+
+function setMode(m){
+  mode = m; showError("");
+  $("title").textContent = m === "login" ? "Login" : "Register";
+  $("submit").textContent = m === "login" ? "Login" : "Create account";
+  $("toggle").textContent = m === "login" ? "No account? Register" : "Have an account? Login";
+  $("nameWrap").classList.toggle("hidden", m === "login");
+}
+
+function showHome(user){
+  $("authView").classList.add("hidden");
+  $("homeView").classList.remove("hidden");
+  $("who").textContent = user.name;
+  loadBooks();
+}
+function showAuth(){
+  $("homeView").classList.add("hidden");
+  $("authView").classList.remove("hidden");
+  setMode("login");
+}
+
+$("toggle").onclick = () => setMode(mode === "login" ? "register" : "login");
+
+$("submit").onclick = async () => {
+  const body = { email: $("email").value, password: $("password").value };
+  if (mode === "register") body.name = $("name").value;
+  try {
+    const r = await fetch("/api/auth/" + mode, {
+      method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)
+    });
+    const data = await r.json();
+    if (!r.ok) return showError(data.error || "Something went wrong");
+    localStorage.setItem("token", data.token);
+    showHome(data.user);
+  } catch { showError("Cannot reach the server"); }
+};
+
+$("logout").onclick = async () => {
+  await fetch("/api/auth/logout", {method: "POST", headers: {Authorization: "Bearer " + token()}}).catch(()=>{});
+  localStorage.removeItem("token");
+  showAuth();
+};
+
+function esc(s){ const d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
+
+function cover(b, i){
+  const fallback = `<div class="cover" style="background:${colors[i % colors.length]}">${esc(b.title)}</div>`;
+  if (!b.cover_image) return fallback;
+  return `<div class="cover"><img src="${esc(b.cover_image)}" alt="${esc(b.title)}"
+            onerror="this.parentNode.outerHTML=this.dataset.fb" data-fb='${fallback.replace(/'/g,"&#39;")}'></div>`;
+}
+
+async function loadBooks(){
+  const r = await fetch("/api/books");
+  const books = await r.json();
+  $("books").innerHTML = books.map((b, i) => `
+    <div class="book">
+      ${cover(b, i)}
+      <div class="info">
+        <h3>${esc(b.title)}</h3>
+        <p class="muted">by ${esc(b.author)}</p>
+        <p class="muted">Category: ${esc(b.category)}</p>
+        <div class="price">$${b.price.toFixed(2)}</div>
+        <p class="muted">Total: ${b.total_quantity} | Available: ${b.available_quantity}</p>
+        <span class="badge ${b.can_borrow ? "yes" : "no"}">${b.can_borrow ? "Available for borrowing" : "Not available"}</span>
+      </div>
+      <div class="actions">
+        <button class="buy" ${b.available_quantity ? "" : "disabled"} onclick="act(${b.id},'buy')">Buy</button>
+        <button class="borrow" ${b.can_borrow ? "" : "disabled"} onclick="act(${b.id},'borrow')">Borrow</button>
+      </div>
+    </div>`).join("");
+}
+
+async function act(id, kind){
+  $("alert").style.display = "none"; $("toast").style.display = "none";
+  const r = await fetch(`/api/books/${id}/${kind}`, {method: "POST", headers: {Authorization: "Bearer " + token()}});
+  const data = await r.json();
+  if (!r.ok){
+    $("alert").textContent = data.error; $("alert").style.display = "block";
+    if (r.status === 401){ localStorage.removeItem("token"); showAuth(); }
+    return;
+  }
+  $("toast").textContent = data.message; $("toast").style.display = "block";
+  loadBooks();
+}
+
+(async () => {
+  if (!token()) return showAuth();
+  const r = await fetch("/api/auth/me", {headers: {Authorization: "Bearer " + token()}});
+  if (r.ok) showHome((await r.json()).user); else { localStorage.removeItem("token"); showAuth(); }
+})();
+</script>
+</body>
+</html>
