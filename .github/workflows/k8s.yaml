@@ -1,5 +1,129 @@
 
-      - name: Save Terraform state after Apply
+name: k8s-cluster
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: Apply or Destroy infrastructure
+        type: choice
+        options:
+          - apply
+          - destroy
+        default: apply
+        required: true
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: terraform-k8s-cluster
+  cancel-in-progress: false
+
+env:
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  AWS_DEFAULT_REGION: eu-west-1
+
+jobs:
+  cluster:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Checkout repository
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. Install Terraform
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      # 3. Configure AWS CLI
+      - name: Configure AWS
+        run: |
+          aws configure set aws_access_key_id "$AWS_ACCESS_KEY_ID" \
+            --profile user-terraform
+
+          aws configure set aws_secret_access_key "$AWS_SECRET_ACCESS_KEY" \
+            --profile user-terraform
+
+          aws configure set region "$AWS_DEFAULT_REGION" \
+            --profile user-terraform
+
+      # 4. Restore Terraform State
+      - name: Restore Terraform State
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p terraform
+
+          RUN=$(gh api \
+            "repos/${{ github.repository }}/actions/artifacts?name=tfstate&per_page=100" \
+            --jq '[.artifacts[] | select(.expired == false) |
+            select(.workflow_run.conclusion == "success")] |
+            sort_by(.created_at) | last | .workflow_run.id // empty')
+
+          if [ -n "$RUN" ]; then
+            echo "Restoring state from workflow run: $RUN"
+
+            gh run download "$RUN" \
+              --name tfstate \
+              --dir terraform
+
+          else
+            echo "ERROR: No previous Terraform state artifact found."
+            echo "Refusing to continue to avoid losing infrastructure tracking."
+            exit 1
+          fi
+
+          if [ ! -s terraform/terraform.tfstate ]; then
+            echo "ERROR: Terraform state is missing or empty."
+            exit 1
+          fi
+
+          echo "Terraform state restored successfully."
+
+      # 5. Terraform Init and Validate
+      - name: Terraform Init and Validate
+        working-directory: terraform
+        run: |
+          terraform init -input=false
+          terraform validate
+
+      # 6. Terraform State List
+      - name: Check Terraform State
+        working-directory: terraform
+        run: |
+          terraform state list
+
+      # 7. Terraform Apply
+      - name: Terraform Apply
+        if: inputs.action == 'apply'
+        working-directory: terraform
+        run: |
+          RUNNER_IP=$(curl -4 -s https://api.ipify.org)
+
+          terraform apply \
+            -input=false \
+            -auto-approve \
+            -var "runner_ip=${RUNNER_IP}/32"
+
+      # 8. Terraform Destroy
+      - name: Terraform Destroy
+        if: inputs.action == 'destroy'
+        working-directory: terraform
+        run: |
+          terraform plan -destroy -input=false
+
+          terraform destroy \
+            -input=false \
+            -auto-approve
+
+      # 9. Save State after successful Apply
+      - name: Save Terraform State
         if: inputs.action == 'apply' && success()
         uses: actions/upload-artifact@v4
         with:
@@ -8,7 +132,8 @@
           retention-days: 90
           if-no-files-found: error
 
-      - name: Delete Terraform state artifact after Destroy
+      # 10. Delete old State artifacts after successful Destroy
+      - name: Delete State Artifacts
         if: inputs.action == 'destroy' && success()
         env:
           GH_TOKEN: ${{ github.token }}
@@ -16,7 +141,67 @@
           ARTIFACTS=$(gh api \
             "repos/${{ github.repository }}/actions/artifacts?name=tfstate&per_page=100")
 
-          echo "$ARTIFACTS" | jq -r '.artifacts[] | .id' | while read ID; do
+          echo "$ARTIFACTS" | jq -r '.artifacts[].id' |
+          while read ID; do
             gh api -X DELETE \
               "repos/${{ github.repository }}/actions/artifacts/$ID"
           done
+
+      # 11. Install SSH Key
+      - name: Install SSH Key
+        if: inputs.action == 'apply'
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/key-mo.pem
+          chmod 400 ~/key-mo.pem
+
+      # 12. Fill Ansible Inventory
+      - name: Fill Ansible Inventory
+        if: inputs.action == 'apply'
+        working-directory: terraform
+        run: |
+          IPS=$(terraform output -json public_ips)
+
+          MASTER_PUBLIC=$(echo "$IPS" | jq -r '.master')
+          WORKER1_PUBLIC=$(echo "$IPS" | jq -r '.worker1')
+          WORKER2_PUBLIC=$(echo "$IPS" | jq -r '.worker2')
+          MASTER_PRIVATE=$(terraform output -raw master_private_ip)
+
+          sed -i \
+            -e "s/MASTER_PUBLIC_IP/$MASTER_PUBLIC/g" \
+            -e "s/MASTER_PRIVATE_IP/$MASTER_PRIVATE/g" \
+            -e "s/WORKER1_PUBLIC_IP/$WORKER1_PUBLIC/g" \
+            -e "s/WORKER2_PUBLIC_IP/$WORKER2_PUBLIC/g" \
+            ../ansible/inventory.yaml
+
+      # 13. Install Ansible
+      - name: Install Ansible
+        if: inputs.action == 'apply'
+        run: |
+          pip install ansible
+
+      # 14. Wait for SSH
+      - name: Wait for SSH
+        if: inputs.action == 'apply'
+        working-directory: ansible
+        run: |
+          for i in $(seq 1 30); do
+            if ansible all -m ping; then
+              echo "All nodes are reachable."
+              exit 0
+            fi
+
+            echo "Waiting for nodes..."
+            sleep 10
+          done
+
+          echo "ERROR: SSH connection failed."
+          exit 1
+
+      # 15. Configure Kubernetes Cluster
+      - name: Run Ansible Playbook
+        if: inputs.action == 'apply'
+        working-directory: ansible
+        run: |
+          ansible-playbook hostname.yaml
