@@ -1,51 +1,23 @@
 
-name: Ansible Kubernetes Setup
+name: Ansible Server Configuration
 
 on:
   workflow_dispatch:
-  workflow_call:
 
 permissions:
   contents: read
 
-concurrency:
-  group: ansible-k8s-setup
-  cancel-in-progress: false
-
-env:
-  AWS_REGION: eu-west-1
-
 jobs:
-  ansible:
-    name: Configure Kubernetes Servers
-    runs-on: self-hosted
-    timeout-minutes: 60
+  configure:
+    name: Configure Servers
+    runs-on: ubuntu-24.04
+
+    env:
+      AWS_REGION: eu-west-1
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Check Prerequisites
-        run: |
-          set -euo pipefail
-
-          command -v jq
-          command -v ssh
-          command -v python3
-
-      - name: Validate SSH Key
-        run: |
-          KEY="$HOME/.ssh/key.pem"
-
-          test -r "$KEY" || {
-            echo "::error::$KEY not found on self-hosted runner"
-            exit 1
-          }
-
-          chmod 600 "$KEY"
-          ssh-keygen -y -f "$KEY" > /dev/null
-
-          echo "ANSIBLE_PRIVATE_KEY_FILE=$KEY" >> "$GITHUB_ENV"
 
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -54,38 +26,44 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Install Requirements
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq ansible
+
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: "1.15.9"
-          terraform_wrapper: false
 
-      - name: Terraform Init
-        working-directory: terraform
-        run: terraform init -input=false -lock-timeout=5m
-
-      - name: Read Terraform Outputs
+      - name: Get Server IPs
         working-directory: terraform
         run: |
-          terraform output -json > "$RUNNER_TEMP/tf-outputs.json"
+          terraform init -input=false
+          terraform output -json > outputs.json
 
-          jq -e '(.public_ips.value // {}) | length > 0' \
-            "$RUNNER_TEMP/tf-outputs.json" > /dev/null
+      - name: Configure SSH Key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/key.pem
+          chmod 600 ~/.ssh/key.pem
 
-      - name: Generate Ansible Inventory
+      - name: Generate Inventory
         working-directory: ansible
         run: |
           bash gen_inventory.sh \
-            < "$RUNNER_TEMP/tf-outputs.json" \
+            < ../terraform/outputs.json \
             > inventory.json
 
       - name: Configure Servers
         working-directory: ansible
         run: |
-          ansible-playbook hostname.yaml
+          ansible-playbook \
+            -i inventory.json \
+            hostname.yaml \
+            --private-key ~/.ssh/key.pem
 
       - name: Cleanup
         if: always()
         run: |
+          rm -f terraform/outputs.json
           rm -f ansible/inventory.json
-          rm -f "$RUNNER_TEMP/tf-outputs.json"
+          rm -f ~/.ssh/key.pem
