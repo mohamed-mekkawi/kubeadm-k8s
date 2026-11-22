@@ -1,50 +1,145 @@
-
 name: Build and Push Library Images
 
 on:
-  workflow_dispatch:
-
   push:
     branches:
       - main
     paths:
-      - 'library/**'
+      - "library/**"
+      - ".github/workflows/build-push.yaml"
+  pull_request:
+    paths:
+      - "library/**"
+      - ".github/workflows/build-push.yaml"
+  workflow_dispatch:
 
 permissions:
   contents: read
 
-jobs:
-  build-push:
-    runs-on: ubuntu-latest
+concurrency:
+  group: build-push-${{ github.ref }}
+  cancel-in-progress: true
 
+env:
+  IMAGE_TAG: ${{ github.sha }}
+  # Only main publishes. PRs and manual runs from other branches build + scan only.
+  PUSH_IMAGES: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Lint + run the whole stack and exercise the API end to end
+  # ---------------------------------------------------------------------------
+  test:
+    name: Lint and integration test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: library
-
-    env:
-      IMAGE_TAG: ${{ github.sha }}
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Ruff
+        run: |
+          pip install ruff
+          ruff check .
+
+      - name: Validate docker-compose file
+        run: docker compose config -q
+
+      # Builds every image, starts the stack and waits for the container healthchecks.
+      - name: Start stack
+        run: docker compose up --build --detach --wait --wait-timeout 180
+
+      - name: Smoke test (frontend -> auth/books -> postgres)
+        run: python3 tests/smoke_test.py
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose logs --no-color
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
+
+  # ---------------------------------------------------------------------------
+  # 2. Build, scan and (on main) push one image per service
+  # ---------------------------------------------------------------------------
+  images:
+    name: Image (${{ matrix.service }})
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - auth-service
+          - books-service
+          - frontend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Lint Dockerfile
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: library/${{ matrix.service }}/Dockerfile
+          failure-threshold: error
+
+      # Same naming as docker-compose.yml: <dockerhub-user>/library-<service>
+      - name: Compute image name
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          REPO="${DOCKERHUB_USERNAME:-local}/library-${{ matrix.service }}"
+          echo "IMAGE_REPO=${REPO,,}" >> "$GITHUB_ENV"
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (local, for scanning)
+        uses: docker/build-push-action@v6
+        with:
+          context: library/${{ matrix.service }}
+          load: true
+          push: false
+          tags: ${{ env.IMAGE_REPO }}:${{ env.IMAGE_TAG }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+      - name: Scan image (Trivy)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.IMAGE_REPO }}:${{ env.IMAGE_TAG }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
       - name: Login to Docker Hub
+        if: env.PUSH_IMAGES == 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Setup Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Push image
+        if: env.PUSH_IMAGES == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: library/${{ matrix.service }}
+          push: true
+          tags: |
+            ${{ env.IMAGE_REPO }}:${{ env.IMAGE_TAG }}
+            ${{ env.IMAGE_REPO }}:latest
+          cache-from: type=gha,scope=${{ matrix.service }}
 
-      - name: Build Images
-        env:
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-        run: |
-          docker compose build
-
-      - name: Push Images
-        env:
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-        run: |
-          docker compose push auth-service books-service frontend
+      - name: Summary
+        if: env.PUSH_IMAGES == 'true'
+        run: echo "Pushed \`${IMAGE_REPO}:${IMAGE_TAG}\` (and \`latest\`)" >> "$GITHUB_STEP_SUMMARY"

@@ -1,50 +1,103 @@
-
 name: Terraform Infrastructure
 
 on:
+  pull_request:
+    paths:
+      - "terraform/**"
+      - ".github/workflows/terraform.yaml"
   workflow_dispatch:
     inputs:
       action:
-        description: "Choose Terraform action"
+        description: "plan = dry run | apply = create/update | destroy = delete everything"
         required: true
         type: choice
         options:
+          - plan
           - apply
           - destroy
-        default: apply
+        default: plan
+      configure_cluster:
+        description: "After apply, build the Kubernetes cluster (runs the Ansible workflow)"
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: read
 
+# One run at a time against the same state. Pull requests only validate, so they
+# get their own group and never wait behind (or block) an apply.
 concurrency:
-  group: terraform-k8s-infrastructure
+  group: ${{ github.event_name == 'pull_request' && format('terraform-pr-{0}', github.ref) || 'terraform-k8s-infrastructure' }}
   cancel-in-progress: false
 
 env:
   AWS_REGION: eu-west-1
-  TF_IN_AUTOMATION: true
+  TF_VERSION: "1.15.9" # keep identical to ansible.yaml: older Terraform cannot read newer state
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
 
 jobs:
-  terraform:
-    name: Terraform ${{ inputs.action }}
+  # ---------------------------------------------------------------------------
+  # 1. Static checks - no cloud credentials needed
+  # ---------------------------------------------------------------------------
+  validate:
+    name: Validate and scan
     runs-on: ubuntu-latest
-
-    defaults:
-      run:
-        working-directory: terraform
-
+    timeout-minutes: 10
     steps:
-      # 1. Checkout repository
-      - name: Checkout Repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      # 2. Install Terraform
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: "1.15.9"
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
 
-      # 3. Configure AWS credentials
+      - name: Terraform fmt
+        working-directory: terraform
+        run: terraform fmt -check -recursive -diff
+
+      - name: Terraform init (no backend)
+        working-directory: terraform
+        run: terraform init -backend=false
+
+      - name: Terraform validate
+        working-directory: terraform
+        run: terraform validate
+
+      - name: Security scan (Trivy)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: config
+          scan-ref: terraform
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          trivyignores: terraform/.trivyignore
+
+  # ---------------------------------------------------------------------------
+  # 2. Plan - always runs for manual runs; apply/destroy execute THIS plan
+  # ---------------------------------------------------------------------------
+  plan:
+    name: Terraform plan (${{ inputs.action }})
+    needs: validate
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -52,41 +105,161 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # 4. Verify AWS identity
       - name: Verify AWS Identity
         run: aws sts get-caller-identity
 
-      # 5. Initialize Terraform and connect to S3
       - name: Terraform Init
-        run: terraform init -input=false -lock-timeout=5m
+        run: terraform init -lock-timeout=5m
 
-      # 6. Validate Terraform configuration
-      - name: Terraform Validate
-        run: terraform validate
+      # Without an S3 backend the runner would plan against an empty local state.
+      - name: Assert S3 remote backend is active
+        run: |
+          TYPE=$(jq -r '.backend.type // "local"' .terraform/terraform.tfstate)
+          if [ "$TYPE" != "s3" ]; then
+            echo "::error::Backend is '$TYPE', expected 's3'. Is terraform/backend.tf present?"
+            exit 1
+          fi
 
-      # 7. Create Apply Plan
+      - name: Guard - refuse to destroy an empty state
+        if: inputs.action == 'destroy'
+        run: |
+          COUNT=$(terraform state pull | jq '[.resources[]?.instances[]?] | length')
+          echo "Resources in remote state: $COUNT"
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::Remote state is empty - nothing to destroy (or the wrong state is attached)."
+            exit 1
+          fi
+
       - name: Terraform Plan
-        if: inputs.action == 'apply'
-        run: terraform plan -input=false -lock-timeout=5m -out=tfplan
+        env:
+          DESTROY_FLAG: ${{ inputs.action == 'destroy' && '-destroy' || '' }}
+        run: |
+          # shellcheck disable=SC2086
+          terraform plan $DESTROY_FLAG -lock-timeout=5m -out=tfplan
+          terraform show -no-color tfplan > plan.txt
 
-      # 8. Apply infrastructure
+      - name: Publish plan to job summary
+        run: |
+          {
+            echo "### Terraform plan: ${{ inputs.action }}"
+            echo '```'
+            head -c 100000 plan.txt
+            echo
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload plan
+        if: inputs.action != 'plan'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: terraform/tfplan
+          retention-days: 1
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 3a. Apply - the exact plan from the previous job.
+  #     Add required reviewers to the "production" environment for a manual gate.
+  # ---------------------------------------------------------------------------
+  apply:
+    name: Terraform apply
+    needs: plan
+    if: inputs.action == 'apply'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: production
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform Init
+        run: terraform init -lock-timeout=5m
+
+      - name: Download reviewed plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+          path: terraform
+
       - name: Terraform Apply
-        if: inputs.action == 'apply'
-        run: terraform apply -input=false -lock-timeout=5m -auto-approve tfplan
+        run: terraform apply -lock-timeout=5m tfplan
 
-      # 9. Create Destroy Plan
-      - name: Terraform Destroy Plan
-        if: inputs.action == 'destroy'
-        run: terraform plan -destroy -input=false -lock-timeout=5m -out=tfplan
+      - name: Show outputs and state
+        if: always()
+        run: |
+          terraform output || true
+          terraform state list || true
 
-      # 10. Destroy infrastructure
+  # ---------------------------------------------------------------------------
+  # 3b. Destroy - separate environment so it can have its own approvers
+  # ---------------------------------------------------------------------------
+  destroy:
+    name: Terraform destroy
+    needs: plan
+    if: inputs.action == 'destroy'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: production-destroy
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform Init
+        run: terraform init -lock-timeout=5m
+
+      - name: Download reviewed destroy plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+          path: terraform
+
       - name: Terraform Destroy
-        if: inputs.action == 'destroy'
-        run: terraform apply -input=false -lock-timeout=5m -auto-approve tfplan
+        run: terraform apply -lock-timeout=5m tfplan
 
-      # 11. Show final Terraform state
-      - name: Show Terraform State
-        if: always() && steps.init.outcome == 'success'
-        run: terraform state list
-        continue-on-error: true
-        id: state
+      - name: Show remaining state
+        if: always()
+        run: terraform state list || true
+
+  # ---------------------------------------------------------------------------
+  # 4. Optional: build the Kubernetes cluster right after a successful apply
+  # ---------------------------------------------------------------------------
+  configure-cluster:
+    name: Configure cluster (Ansible)
+    needs: apply
+    if: inputs.action == 'apply' && inputs.configure_cluster
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ansible.yaml
+    secrets: inherit
