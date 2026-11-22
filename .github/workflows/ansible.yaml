@@ -15,7 +15,6 @@ env:
   AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
   AWS_DEFAULT_REGION: eu-west-1
-  AWS_PROFILE: new-user
   ANSIBLE_HOST_KEY_CHECKING: "False"
 
 jobs:
@@ -39,25 +38,13 @@ jobs:
         with:
           terraform_wrapper: false
 
-      # 4. Configure AWS
-      - name: Configure AWS
-        run: |
-          aws configure set aws_access_key_id "$AWS_ACCESS_KEY_ID" \
-            --profile new-user
-
-          aws configure set aws_secret_access_key "$AWS_SECRET_ACCESS_KEY" \
-            --profile new-user
-
-          aws configure set region "$AWS_DEFAULT_REGION" \
-            --profile new-user
-
-      # 5. Terraform Init
+      # 4. Terraform Init
       - name: Terraform Init
         working-directory: terraform
         run: |
           terraform init -input=false
 
-      # 6. Get EC2 IPs
+      # 5. Get EC2 IPs
       - name: Get EC2 IPs
         working-directory: terraform
         run: |
@@ -74,27 +61,14 @@ jobs:
           echo "WORKER2_PUBLIC=$WORKER2_PUBLIC" >> "$GITHUB_ENV"
           echo "MASTER_PRIVATE=$MASTER_PRIVATE" >> "$GITHUB_ENV"
 
-      # 7. Install SSH Key
-      - name: Install SSH Key
-        env:
-          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+      # 6. Validate Existing SSH Key
+      - name: Validate SSH Key
         run: |
-          set -e
+          test -r "$HOME/.ssh/key.pem"
+          ssh-keygen -y -f "$HOME/.ssh/key.pem" > /dev/null
+          echo "Existing SSH key is valid."
 
-          mkdir -p "$HOME/.ssh"
-          chmod 700 "$HOME/.ssh"
-
-          test -n "$SSH_PRIVATE_KEY"
-
-          printf '%s\n' "$SSH_PRIVATE_KEY" > "$HOME/.ssh/key-mo.pem"
-
-          chmod 400 "$HOME/.ssh/key-mo.pem"
-
-          ssh-keygen -y -f "$HOME/.ssh/key-mo.pem" > /dev/null
-
-          echo "SSH key validated successfully."
-
-      # 8. Configure Ansible Inventory
+      # 7. Configure Ansible Inventory
       - name: Configure Ansible Inventory
         run: |
           sed -i \
@@ -104,34 +78,37 @@ jobs:
             -e "s/WORKER2_PUBLIC_IP/$WORKER2_PUBLIC/g" \
             ansible/inventory.yaml
 
-      # 9. Install Ansible
+      # 8. Install Ansible
       - name: Install Ansible
         run: |
           python3 -m venv "$HOME/ansible-venv"
           "$HOME/ansible-venv/bin/pip" install --upgrade pip
           "$HOME/ansible-venv/bin/pip" install ansible
 
-      # 10. Wait for SSH
+      # 9. Wait for SSH
       - name: Wait for SSH
         working-directory: ansible
         run: |
           "$HOME/ansible-venv/bin/ansible" all \
             -i inventory.yaml \
+            --private-key "$HOME/.ssh/key.pem" \
             -m ansible.builtin.wait_for_connection \
             -a "timeout=300 sleep=10"
 
-      # 11. Ansible Ping
+      # 10. Ansible Ping
       - name: Ansible Ping
         working-directory: ansible
         run: |
           "$HOME/ansible-venv/bin/ansible" all \
             -i inventory.yaml \
+            --private-key "$HOME/.ssh/key.pem" \
             -m ping
 
-      # 12. Run Ansible Playbook
+      # 11. Run Ansible Playbook
       - name: Run Ansible Playbook
         working-directory: ansible
         run: |
           "$HOME/ansible-venv/bin/ansible-playbook" \
             -i inventory.yaml \
+            --private-key "$HOME/.ssh/key.pem" \
             hostname.yaml
