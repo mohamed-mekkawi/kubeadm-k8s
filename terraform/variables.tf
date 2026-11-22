@@ -21,7 +21,7 @@ variable "instance_type" {
 variable "nodes" {
   type = list(string)
 
-} 
+}
 variable "runner_ip" {
   description = "IP الـ GitHub runner (بيتبعت من الـ pipeline)"
   type        = string

@@ -1,5 +1,5 @@
 provider "aws" {
-  region  = var.region
+  region = var.region
 }
 
 locals {
@@ -52,7 +52,7 @@ resource "aws_security_group" "k8s" {
 resource "aws_instance" "node" {
   for_each               = toset(var.nodes)
   ami                    = data.aws_ssm_parameter.ubuntu.value
-  key_name              = var.key_name
+  key_name               = var.key_name
   instance_type          = var.instance_type
   vpc_security_group_ids = [aws_security_group.k8s.id]
 
