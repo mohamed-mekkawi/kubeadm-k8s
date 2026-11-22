@@ -1,9 +1,16 @@
+
 output "public_ips" {
-  value = { for k, v in aws_instance.node : k => v.public_ip }
+  value = {
+    for k, v in aws_instance.node : k => v.public_ip
+  }
 }
 
 output "master_private_ip" {
   value = aws_instance.node[local.master].private_ip
+}
+
+output "master_name" {
+  value = local.master
 }
 
 output "ssh_master" {
