@@ -48,11 +48,12 @@ jobs:
         working-directory: terraform
         run: terraform output -json > outputs.json
 
-      # 6. Install Ansible
+      # 6. Install Ansible and PyYAML
       - name: Install Ansible
         run: |
           sudo apt-get update
           sudo apt-get install -y ansible
+          python3 -m pip install --user pyyaml --break-system-packages
 
       # 7. Configure SSH key
       - name: Setup SSH Key
@@ -63,12 +64,13 @@ jobs:
           printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/key-mo.pem
           chmod 600 ~/.ssh/key-mo.pem
 
-      # 8. Generate Ansible Inventory from Terraform outputs
+      # 8. Generate Ansible YAML Inventory from Terraform outputs
       - name: Generate Inventory
         working-directory: terraform
         run: |
           python3 - <<'PY'
           import json
+          import yaml
 
           with open("outputs.json") as f:
               outputs = json.load(f)
@@ -76,33 +78,52 @@ jobs:
           public_ips = outputs["public_ips"]["value"]
           node_names = outputs["node_names"]["value"]
 
+          if not node_names:
+              raise ValueError("No nodes found in Terraform outputs")
+
           master_name = node_names[0]
 
           if master_name not in public_ips:
-              raise ValueError(f"Master node {master_name} not found in public_ips")
+              raise ValueError(f"Master {master_name} not found in public_ips")
 
-          master_ip = public_ips[master_name]
+          worker_names = node_names[1:]
 
-          worker_names = [
-              name for name in node_names
-              if name != master_name
-          ]
+          for name in worker_names:
+              if name not in public_ips:
+                  raise ValueError(f"Worker {name} not found in public_ips")
 
-          with open("../ansible/inventory.ini", "w") as f:
-              f.write("[master]\n")
-              f.write(f"{master_name} ansible_host={master_ip}\n\n")
+          inventory = {
+              "all": {
+                  "vars": {
+                      "ansible_user": "ubuntu",
+                      "ansible_ssh_private_key_file": "~/.ssh/key-mo.pem",
+                      "ansible_ssh_common_args": "-o StrictHostKeyChecking=accept-new"
+                  },
+                  "children": {
+                      "master": {
+                          "hosts": {
+                              master_name: {
+                                  "ansible_host": public_ips[master_name]
+                              }
+                          }
+                      },
+                      "workers": {
+                          "hosts": {
+                              name: {
+                                  "ansible_host": public_ips[name]
+                              }
+                              for name in worker_names
+                          }
+                      }
+                  }
+              }
+          }
 
-              f.write("[workers]\n")
-              for name in worker_names:
-                  f.write(f"{name} ansible_host={public_ips[name]}\n")
-
-              f.write("\n[all:vars]\n")
-              f.write("ansible_user=ubuntu\n")
-              f.write("ansible_ssh_private_key_file=~/.ssh/key-mo.pem\n")
-              f.write("ansible_ssh_common_args='-o StrictHostKeyChecking=accept-new'\n")
+          with open("../ansible/inventory.yaml", "w") as f:
+              yaml.safe_dump(inventory, f, sort_keys=False)
 
           print("Inventory generated successfully:")
-          print(open("../ansible/inventory.ini").read())
+          print(yaml.safe_dump(inventory, sort_keys=False))
           PY
 
       # 9. Test SSH connectivity
