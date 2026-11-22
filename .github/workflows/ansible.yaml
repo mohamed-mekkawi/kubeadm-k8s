@@ -1,100 +1,51 @@
+
 name: Ansible Kubernetes Setup
 
 on:
-  pull_request:
-    paths:
-      - "ansible/**"
-      - ".github/workflows/ansible.yaml"
   workflow_dispatch:
-  workflow_call: # called by terraform.yaml after a successful apply
+  workflow_call:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.event_name == 'pull_request' && format('ansible-pr-{0}', github.ref) || 'ansible-k8s-setup' }}
+  group: ansible-k8s-setup
   cancel-in-progress: false
 
 env:
   AWS_REGION: eu-west-1
-  TF_VERSION: "1.15.9" # keep identical to terraform.yaml
 
 jobs:
-  # ---------------------------------------------------------------------------
-  # 1. Static checks on GitHub-hosted runners (also gates every real run)
-  # ---------------------------------------------------------------------------
-  validate:
-    name: Validate playbook
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: ansible/requirements.txt
-
-      - name: Install Ansible tooling
-        working-directory: ansible
-        run: |
-          pip install -r requirements.txt "ansible-lint>=26,<27"
-          ansible-galaxy collection install -r requirements.yml
-
-      - name: Syntax check
-        working-directory: ansible
-        run: ansible-playbook cluster.yaml --syntax-check -i localhost,
-
-      - name: Lint
-        working-directory: ansible
-        run: ansible-lint cluster.yaml
-
-  # ---------------------------------------------------------------------------
-  # 2. Build the cluster. Runs on the self-hosted runner because the security
-  #    group only allows SSH from terraform/terraform.tfvars -> my_ip.
-  # ---------------------------------------------------------------------------
   ansible:
-    name: Build Kubernetes cluster
-    needs: validate
-    if: github.event_name != 'pull_request'
+    name: Configure Kubernetes Servers
     runs-on: self-hosted
     timeout-minutes: 60
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Only touches apt when something is actually missing.
-      - name: Check runner prerequisites
+      - name: Check Prerequisites
         run: |
           set -euo pipefail
-          pkgs=()
-          command -v jq      >/dev/null || pkgs+=(jq)
-          command -v ssh     >/dev/null || pkgs+=(openssh-client)
-          command -v python3 >/dev/null || pkgs+=(python3)
-          python3 -c 'import ensurepip, venv' 2>/dev/null || pkgs+=(python3-venv)
-          if [ "${#pkgs[@]}" -gt 0 ]; then
-            echo "Installing: ${pkgs[*]}"
-            sudo apt-get update -q
-            sudo apt-get install -y -q "${pkgs[@]}"
-          fi
 
-      - name: Validate SSH key
+          command -v jq
+          command -v ssh
+          command -v python3
+
+      - name: Validate SSH Key
         run: |
           KEY="$HOME/.ssh/key.pem"
-          test -r "$KEY" || { echo "::error::$KEY not found on this runner"; exit 1; }
-          chmod 600 "$KEY"
-          ssh-keygen -y -f "$KEY" >/dev/null
-          echo "ANSIBLE_PRIVATE_KEY_FILE=$KEY" >> "$GITHUB_ENV"
-          echo "SSH key is valid."
 
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: ${{ env.TF_VERSION }}
-          terraform_wrapper: false
+          test -r "$KEY" || {
+            echo "::error::$KEY not found on self-hosted runner"
+            exit 1
+          }
+
+          chmod 600 "$KEY"
+          ssh-keygen -y -f "$KEY" > /dev/null
+
+          echo "ANSIBLE_PRIVATE_KEY_FILE=$KEY" >> "$GITHUB_ENV"
 
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -103,40 +54,52 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.15.9"
+          terraform_wrapper: false
+
       - name: Terraform Init
         working-directory: terraform
         run: terraform init -input=false -lock-timeout=5m
 
-      - name: Read Terraform outputs
+      - name: Read Terraform Outputs
         working-directory: terraform
         run: |
           terraform output -json > "$RUNNER_TEMP/tf-outputs.json"
-          if ! jq -e '(.public_ips.value // {}) | length > 0' "$RUNNER_TEMP/tf-outputs.json" >/dev/null; then
-            echo "::error::Terraform has no outputs. Run the Terraform workflow with action=apply first."
-            exit 1
-          fi
 
-      # Node names and IPs come from Terraform; the script fails on any null/empty IP.
-      - name: Generate Ansible inventory
+          jq -e '(.public_ips.value // {}) | length > 0' \
+            "$RUNNER_TEMP/tf-outputs.json" > /dev/null
+
+      - name: Generate Ansible Inventory
         working-directory: ansible
-        run: bash gen_inventory.sh < "$RUNNER_TEMP/tf-outputs.json" > inventory.json
+        run: |
+          bash gen_inventory.sh \
+            < "$RUNNER_TEMP/tf-outputs.json" \
+            > inventory.json
 
       - name: Install Ansible
         run: |
           python3 -m venv "$HOME/ansible-venv"
-          "$HOME/ansible-venv/bin/pip" install --quiet --upgrade pip
-          "$HOME/ansible-venv/bin/pip" install --quiet -r ansible/requirements.txt
-          "$HOME/ansible-venv/bin/ansible-galaxy" collection install -r ansible/requirements.yml
+
+          "$HOME/ansible-venv/bin/pip" install --upgrade pip
+
+          "$HOME/ansible-venv/bin/pip" install \
+            -r ansible/requirements.txt
+
+          "$HOME/ansible-venv/bin/ansible-galaxy" collection install \
+            -r ansible/requirements.yml
+
           echo "$HOME/ansible-venv/bin" >> "$GITHUB_PATH"
 
-      - name: Wait for SSH on all nodes
+      - name: Configure Servers
         working-directory: ansible
-        run: ansible all -m ansible.builtin.wait_for_connection -a "timeout=300 sleep=10"
-
-      - name: Run playbook
-        working-directory: ansible
-        run: ansible-playbook cluster.yaml
+        run: |
+          ansible-playbook hostname.yaml
 
       - name: Cleanup
         if: always()
-        run: rm -f ansible/inventory.json "$RUNNER_TEMP/tf-outputs.json"
+        run: |
+          rm -f ansible/inventory.json
+          rm -f "$RUNNER_TEMP/tf-outputs.json"
