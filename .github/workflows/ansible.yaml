@@ -79,20 +79,6 @@ jobs:
             < "$RUNNER_TEMP/tf-outputs.json" \
             > inventory.json
 
-      - name: Install Ansible
-        run: |
-          python3 -m venv "$HOME/ansible-venv"
-
-          "$HOME/ansible-venv/bin/pip" install --upgrade pip
-
-          "$HOME/ansible-venv/bin/pip" install \
-            -r ansible/requirements.txt
-
-          "$HOME/ansible-venv/bin/ansible-galaxy" collection install \
-            -r ansible/requirements.yml
-
-          echo "$HOME/ansible-venv/bin" >> "$GITHUB_PATH"
-
       - name: Configure Servers
         working-directory: ansible
         run: |
