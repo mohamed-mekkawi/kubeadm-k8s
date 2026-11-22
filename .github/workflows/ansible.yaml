@@ -65,6 +65,7 @@ jobs:
           chmod 600 ~/.ssh/key-mo.pem
 
       # 8. Generate Ansible YAML Inventory from Terraform outputs
+     
       - name: Generate Inventory
         working-directory: terraform
         run: |
@@ -76,21 +77,23 @@ jobs:
               outputs = json.load(f)
 
           public_ips = outputs["public_ips"]["value"]
-          node_names = outputs["node_names"]["value"]
+          master_private_ip = outputs["master_private_ip"]["value"]
 
-          if not node_names:
-              raise ValueError("No nodes found in Terraform outputs")
+          master_name = None
 
-          master_name = node_names[0]
+          # Find master using its private IP
+          for name, ip in public_ips.items():
+              if ip == master_private_ip:
+                  master_name = name
+                  break
 
-          if master_name not in public_ips:
-              raise ValueError(f"Master {master_name} not found in public_ips")
+          if master_name is None:
+              raise ValueError("Could not identify master node")
 
-          worker_names = node_names[1:]
-
-          for name in worker_names:
-              if name not in public_ips:
-                  raise ValueError(f"Worker {name} not found in public_ips")
+          worker_names = [
+              name for name in public_ips
+              if name != master_name
+          ]
 
           inventory = {
               "all": {
@@ -125,6 +128,7 @@ jobs:
           print("Inventory generated successfully:")
           print(yaml.safe_dump(inventory, sort_keys=False))
           PY
+
 
       # 9. Test SSH connectivity
       - name: Test Ansible Connectivity
