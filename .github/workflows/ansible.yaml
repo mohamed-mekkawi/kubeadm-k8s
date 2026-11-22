@@ -73,26 +73,45 @@ jobs:
           with open("outputs.json") as f:
               outputs = json.load(f)
 
-          master = outputs["master_public_ip"]["value"]
-          workers = outputs["worker_public_ips"]["value"]
+          public_ips = outputs["public_ips"]["value"]
+          node_names = outputs["node_names"]["value"]
+
+          master_name = node_names[0]
+
+          if master_name not in public_ips:
+              raise ValueError(f"Master node {master_name} not found in public_ips")
+
+          master_ip = public_ips[master_name]
+
+          worker_names = [
+              name for name in node_names
+              if name != master_name
+          ]
 
           with open("../ansible/inventory.ini", "w") as f:
               f.write("[master]\n")
-              f.write(f"{master}\n\n")
+              f.write(f"{master_name} ansible_host={master_ip}\n\n")
 
               f.write("[workers]\n")
-              for ip in workers:
-                  f.write(f"{ip}\n")
+              for name in worker_names:
+                  f.write(f"{name} ansible_host={public_ips[name]}\n")
 
               f.write("\n[all:vars]\n")
               f.write("ansible_user=ubuntu\n")
               f.write("ansible_ssh_private_key_file=~/.ssh/key-mo.pem\n")
               f.write("ansible_ssh_common_args='-o StrictHostKeyChecking=accept-new'\n")
 
-          print("Inventory generated successfully")
+          print("Inventory generated successfully:")
+          print(open("../ansible/inventory.ini").read())
           PY
 
-      # 9. Run Ansible
+      # 9. Test SSH connectivity
+      - name: Test Ansible Connectivity
+        working-directory: ansible
+        run: |
+          ansible all -i inventory.ini -m ping
+
+      # 10. Run Ansible Playbook
       - name: Run Ansible Playbook
         working-directory: ansible
         run: |
