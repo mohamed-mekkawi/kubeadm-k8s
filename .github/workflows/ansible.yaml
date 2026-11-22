@@ -22,9 +22,11 @@ jobs:
     timeout-minutes: 60
 
     steps:
+      # 1. Download project files
       - name: Checkout Repository
         uses: actions/checkout@v4
 
+      # 2. Connect to AWS
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -32,31 +34,66 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
+      # 3. Install Terraform
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
 
+      # 4. Initialize Terraform S3 Backend
+      - name: Terraform Init
+        working-directory: terraform
+        run: terraform init -input=false -reconfigure
+
+      # 5. Read existing infrastructure outputs
       - name: Get Terraform Outputs
         working-directory: terraform
         run: terraform output -json > outputs.json
 
-      - name: Setup SSH Key
-        run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/key-mo.pem
-          chmod 600 ~/.ssh/key-mo.pem
-
+      # 6. Install Ansible
       - name: Install Ansible
         run: |
           sudo apt-get update
           sudo apt-get install -y ansible
 
-      - name: Configure SSH for Ansible
+      # 7. Configure SSH key
+      - name: Setup SSH Key
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
         run: |
           mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
-          ssh-keyscan -H "$(cd terraform && terraform output -raw master_public_ip)" >> ~/.ssh/known_hosts
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/key-mo.pem
+          chmod 600 ~/.ssh/key-mo.pem
 
+      # 8. Generate Ansible Inventory from Terraform outputs
+      - name: Generate Inventory
+        working-directory: terraform
+        run: |
+          python3 - <<'PY'
+          import json
+
+          with open("outputs.json") as f:
+              outputs = json.load(f)
+
+          master = outputs["master_public_ip"]["value"]
+          workers = outputs["worker_public_ips"]["value"]
+
+          with open("../ansible/inventory.ini", "w") as f:
+              f.write("[master]\n")
+              f.write(f"{master}\n\n")
+
+              f.write("[workers]\n")
+              for ip in workers:
+                  f.write(f"{ip}\n")
+
+              f.write("\n[all:vars]\n")
+              f.write("ansible_user=ubuntu\n")
+              f.write("ansible_ssh_private_key_file=~/.ssh/key-mo.pem\n")
+              f.write("ansible_ssh_common_args='-o StrictHostKeyChecking=accept-new'\n")
+
+          print("Inventory generated successfully")
+          PY
+
+      # 9. Run Ansible
       - name: Run Ansible Playbook
         working-directory: ansible
         run: |
-          ansible-playbook -i inventory.yaml hostname.yaml
+          ansible-playbook -i inventory.ini hostname.yaml
