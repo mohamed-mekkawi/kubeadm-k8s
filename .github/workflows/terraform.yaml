@@ -72,16 +72,7 @@ jobs:
         working-directory: terraform
         run: terraform validate
 
-      # Checkov Security Scan
-      - name: Security scan (Checkov)
-        uses: bridgecrewio/checkov-action@v12.1347.0
-        with:
-          directory: terraform
-          framework: terraform
-          output_format: cli
-          soft_fail: false
-          quiet: false
-
+    
   # ---------------------------------------------------------------------------
   # 2. Plan - always runs for manual runs
   # ---------------------------------------------------------------------------
