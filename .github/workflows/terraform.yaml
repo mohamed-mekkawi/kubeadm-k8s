@@ -1,3 +1,4 @@
+
 name: Terraform Infrastructure
 
 on:
@@ -5,6 +6,7 @@ on:
     paths:
       - "terraform/**"
       - ".github/workflows/terraform.yaml"
+
   workflow_dispatch:
     inputs:
       action:
@@ -16,6 +18,7 @@ on:
           - apply
           - destroy
         default: plan
+
       configure_cluster:
         description: "After apply, build the Kubernetes cluster (runs the Ansible workflow)"
         required: false
@@ -25,26 +28,28 @@ on:
 permissions:
   contents: read
 
-# One run at a time against the same state. Pull requests only validate, so they
-# get their own group and never wait behind (or block) an apply.
+# One run at a time against the same state.
 concurrency:
   group: ${{ github.event_name == 'pull_request' && format('terraform-pr-{0}', github.ref) || 'terraform-k8s-infrastructure' }}
   cancel-in-progress: false
 
 env:
   AWS_REGION: eu-west-1
-  TF_VERSION: "1.15.9" # keep identical to ansible.yaml: older Terraform cannot read newer state
+  TF_VERSION: "1.15.9"
   TF_IN_AUTOMATION: "true"
   TF_INPUT: "false"
 
 jobs:
+
   # ---------------------------------------------------------------------------
   # 1. Static checks - no cloud credentials needed
   # ---------------------------------------------------------------------------
+
   validate:
     name: Validate and scan
     runs-on: ubuntu-latest
     timeout-minutes: 10
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -67,27 +72,31 @@ jobs:
         working-directory: terraform
         run: terraform validate
 
-      - name: Security scan (Trivy)
-        uses: aquasecurity/trivy-action@0.28.0
+      # Checkov Security Scan
+      - name: Security scan (Checkov)
+        uses: bridgecrewio/checkov-action@v12.1347.0
         with:
-          scan-type: config
-          scan-ref: terraform
-          severity: HIGH,CRITICAL
-          exit-code: "1"
-          trivyignores: terraform/.trivyignore
+          directory: terraform
+          framework: terraform
+          output_format: cli
+          soft_fail: false
+          quiet: false
 
   # ---------------------------------------------------------------------------
-  # 2. Plan - always runs for manual runs; apply/destroy execute THIS plan
+  # 2. Plan - always runs for manual runs
   # ---------------------------------------------------------------------------
+
   plan:
     name: Terraform plan (${{ inputs.action }})
     needs: validate
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 15
+
     defaults:
       run:
         working-directory: terraform
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -111,10 +120,10 @@ jobs:
       - name: Terraform Init
         run: terraform init -lock-timeout=5m
 
-      # Without an S3 backend the runner would plan against an empty local state.
       - name: Assert S3 remote backend is active
         run: |
           TYPE=$(jq -r '.backend.type // "local"' .terraform/terraform.tfstate)
+
           if [ "$TYPE" != "s3" ]; then
             echo "::error::Backend is '$TYPE', expected 's3'. Is terraform/backend.tf present?"
             exit 1
@@ -124,7 +133,9 @@ jobs:
         if: inputs.action == 'destroy'
         run: |
           COUNT=$(terraform state pull | jq '[.resources[]?.instances[]?] | length')
+
           echo "Resources in remote state: $COUNT"
+
           if [ "$COUNT" -eq 0 ]; then
             echo "::error::Remote state is empty - nothing to destroy (or the wrong state is attached)."
             exit 1
@@ -136,6 +147,7 @@ jobs:
         run: |
           # shellcheck disable=SC2086
           terraform plan $DESTROY_FLAG -lock-timeout=5m -out=tfplan
+
           terraform show -no-color tfplan > plan.txt
 
       - name: Publish plan to job summary
@@ -158,9 +170,9 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
-  # 3a. Apply - the exact plan from the previous job.
-  #     Add required reviewers to the "production" environment for a manual gate.
+  # 3a. Apply
   # ---------------------------------------------------------------------------
+
   apply:
     name: Terraform apply
     needs: plan
@@ -168,9 +180,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     environment: production
+
     defaults:
       run:
         working-directory: terraform
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -207,8 +221,9 @@ jobs:
           terraform state list || true
 
   # ---------------------------------------------------------------------------
-  # 3b. Destroy - separate environment so it can have its own approvers
+  # 3b. Destroy
   # ---------------------------------------------------------------------------
+
   destroy:
     name: Terraform destroy
     needs: plan
@@ -216,9 +231,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     environment: production-destroy
+
     defaults:
       run:
         working-directory: terraform
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -253,13 +270,16 @@ jobs:
         run: terraform state list || true
 
   # ---------------------------------------------------------------------------
-  # 4. Optional: build the Kubernetes cluster right after a successful apply
+  # 4. Configure Kubernetes cluster using Ansible
   # ---------------------------------------------------------------------------
+
   configure-cluster:
     name: Configure cluster (Ansible)
     needs: apply
     if: inputs.action == 'apply' && inputs.configure_cluster
+
     permissions:
       contents: read
+
     uses: ./.github/workflows/ansible.yaml
     secrets: inherit
