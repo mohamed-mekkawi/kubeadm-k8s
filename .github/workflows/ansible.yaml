@@ -18,7 +18,7 @@ env:
 jobs:
   ansible:
     name: Configure Kubernetes Servers
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     timeout-minutes: 60
 
     steps:
@@ -55,11 +55,10 @@ jobs:
           sudo apt-get install -y ansible
 
       - name: Configure SSH for Ansible
-        working-directory: ansible
         run: |
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
-          ssh-keyscan -H "$(terraform -chdir=../terraform output -raw master_public_ip)" >> ~/.ssh/known_hosts || true
+          ssh-keyscan -H "$(cd terraform && terraform output -raw master_public_ip)" >> ~/.ssh/known_hosts
 
       - name: Run Ansible Playbook
         working-directory: ansible
