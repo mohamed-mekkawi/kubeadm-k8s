@@ -1,5 +1,5 @@
 region        = "eu-west-1"
-aws_profile   = "user-terraform"
+aws_profile   = "new-user"
 key_name      = "key-mo"
 key_path      = "~/key-mo.pem"
 my_ip         = "197.54.152.247/32"
