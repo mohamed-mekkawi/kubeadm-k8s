@@ -41,8 +41,7 @@ jobs:
       # 4. Terraform Init
       - name: Terraform Init
         working-directory: terraform
-        run: |
-          terraform init -input=false
+        run: terraform init -input=false
 
       # 5. Get EC2 IPs
       - name: Get EC2 IPs
@@ -61,12 +60,20 @@ jobs:
           echo "WORKER2_PUBLIC=$WORKER2_PUBLIC" >> "$GITHUB_ENV"
           echo "MASTER_PRIVATE=$MASTER_PRIVATE" >> "$GITHUB_ENV"
 
-      # 6. Validate Existing SSH Key
-      - name: Validate SSH Key
+      # 6. Prepare SSH Key from GitHub Secrets
+      - name: Prepare SSH Key
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
         run: |
-          test -r "$HOME/.ssh/key.pem"
-          ssh-keygen -y -f "$HOME/.ssh/key.pem" > /dev/null
-          echo "Existing SSH key is valid."
+          set -e
+          test -n "$SSH_PRIVATE_KEY"
+
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$RUNNER_TEMP/key-mo.pem"
+          chmod 600 "$RUNNER_TEMP/key-mo.pem"
+
+          ssh-keygen -y -f "$RUNNER_TEMP/key-mo.pem" > /dev/null
+
+          echo "SSH key is valid."
 
       # 7. Configure Ansible Inventory
       - name: Configure Ansible Inventory
@@ -91,7 +98,7 @@ jobs:
         run: |
           "$HOME/ansible-venv/bin/ansible" all \
             -i inventory.yaml \
-            --private-key "$HOME/.ssh/key.pem" \
+            --private-key "$RUNNER_TEMP/key-mo.pem" \
             -m ansible.builtin.wait_for_connection \
             -a "timeout=300 sleep=10"
 
@@ -101,7 +108,7 @@ jobs:
         run: |
           "$HOME/ansible-venv/bin/ansible" all \
             -i inventory.yaml \
-            --private-key "$HOME/.ssh/key.pem" \
+            --private-key "$RUNNER_TEMP/key-mo.pem" \
             -m ping
 
       # 11. Run Ansible Playbook
@@ -110,5 +117,11 @@ jobs:
         run: |
           "$HOME/ansible-venv/bin/ansible-playbook" \
             -i inventory.yaml \
-            --private-key "$HOME/.ssh/key.pem" \
+            --private-key "$RUNNER_TEMP/key-mo.pem" \
             hostname.yaml
+
+      # 12. Cleanup SSH Key
+      - name: Cleanup SSH Key
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/key-mo.pem"
