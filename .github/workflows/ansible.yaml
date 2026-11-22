@@ -92,16 +92,7 @@ jobs:
           "$HOME/ansible-venv/bin/pip" install --upgrade pip
           "$HOME/ansible-venv/bin/pip" install ansible
 
-      # 9. Wait for SSH
-      - name: Wait for SSH
-        working-directory: ansible
-        run: |
-          "$HOME/ansible-venv/bin/ansible" all \
-            -i inventory.yaml \
-            --private-key "$RUNNER_TEMP/key-mo.pem" \
-            -m ansible.builtin.wait_for_connection \
-            -a "timeout=300 sleep=10"
-
+    
       # 10. Ansible Ping
       - name: Ansible Ping
         working-directory: ansible
