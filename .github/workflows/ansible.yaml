@@ -109,10 +109,10 @@ jobs:
       - name: Test Ansible Connectivity
         working-directory: ansible
         run: |
-          ansible all -i inventory.ini -m ping
+          ansible all -i inventory.yaml -m ping
 
       # 10. Run Ansible Playbook
       - name: Run Ansible Playbook
         working-directory: ansible
         run: |
-          ansible-playbook -i inventory.ini hostname.yaml
+          ansible-playbook -i inventory.yaml hostname.yaml
