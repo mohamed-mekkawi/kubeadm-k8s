@@ -261,16 +261,4 @@ jobs:
         run: terraform state list || true
 
   # ---------------------------------------------------------------------------
-  # 4. Configure Kubernetes cluster using Ansible
-  # ---------------------------------------------------------------------------
-
-  configure-cluster:
-    name: Configure cluster (Ansible)
-    needs: apply
-    if: inputs.action == 'apply' && inputs.configure_cluster
-
-    permissions:
-      contents: read
-
-    uses: ./.github/workflows/ansible.yaml
-    secrets: inherit
+  
