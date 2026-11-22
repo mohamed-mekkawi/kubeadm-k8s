@@ -5,28 +5,28 @@ on:
   workflow_dispatch:
     inputs:
       action:
-        description: Choose Terraform action
+        description: "Choose Terraform action"
+        required: true
         type: choice
         options:
           - apply
           - destroy
         default: apply
-        required: true
 
 permissions:
   contents: read
 
 concurrency:
-  group: terraform-k8s-cluster
+  group: terraform-k8s-infrastructure
   cancel-in-progress: false
 
 env:
-  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-  AWS_DEFAULT_REGION: eu-west-1
+  AWS_REGION: eu-west-1
+  TF_IN_AUTOMATION: true
 
 jobs:
   terraform:
+    name: Terraform ${{ inputs.action }}
     runs-on: ubuntu-latest
 
     defaults:
@@ -34,66 +34,59 @@ jobs:
         working-directory: terraform
 
     steps:
-      - name: Checkout
+      # 1. Checkout repository
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
+      # 2. Install Terraform
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
-          terraform_wrapper: false
+          terraform_version: "1.15.9"
 
-      - name: Configure AWS
-        run: |
-          aws configure set aws_access_key_id "$AWS_ACCESS_KEY_ID" \
-            --profile user-terraform
-          aws configure set aws_secret_access_key "$AWS_SECRET_ACCESS_KEY" \
-            --profile user-terraform
-          aws configure set region "$AWS_DEFAULT_REGION" \
-            --profile user-terraform
+      # 3. Configure AWS credentials
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
 
+      # 4. Verify AWS identity
+      - name: Verify AWS Identity
+        run: aws sts get-caller-identity
+
+      # 5. Initialize Terraform and connect to S3
       - name: Terraform Init
-        run: terraform init -input=false
+        run: terraform init -input=false -lock-timeout=5m
 
+      # 6. Validate Terraform configuration
       - name: Terraform Validate
         run: terraform validate
 
-      # حماية: لا نسمح بالعمل على بنية موجودة
-      # إلا لو الـ Remote State متابع مواردها بالفعل.
-      - name: Verify Remote State
-        run: |
-          terraform state pull > "$RUNNER_TEMP/terraform.tfstate"
-
-          COUNT=$(jq '[.resources[]?.instances[]?] | length' \
-            "$RUNNER_TEMP/terraform.tfstate")
-
-          echo "Managed resources in state: $COUNT"
-
-          if [ "$COUNT" -eq 0 ]; then
-            echo "ERROR: No managed resources found in S3 state."
-            echo "Recover or import existing resources before continuing."
-            exit 1
-          fi
-
-          terraform state list
-
+      # 7. Create Apply Plan
       - name: Terraform Plan
         if: inputs.action == 'apply'
-        run: |
-          RUNNER_IP=$(curl -4 -s https://api.ipify.org)
+        run: terraform plan -input=false -lock-timeout=5m -out=tfplan
 
-          terraform plan -input=false \
-            -var "runner_ip=${RUNNER_IP}/32"
-
+      # 8. Apply infrastructure
       - name: Terraform Apply
         if: inputs.action == 'apply'
-        run: |
-          RUNNER_IP=$(curl -4 -s https://api.ipify.org)
+        run: terraform apply -input=false -lock-timeout=5m -auto-approve tfplan
 
-          terraform apply -input=false -auto-approve \
-            -var "runner_ip=${RUNNER_IP}/32"
+      # 9. Create Destroy Plan
+      - name: Terraform Destroy Plan
+        if: inputs.action == 'destroy'
+        run: terraform plan -destroy -input=false -lock-timeout=5m -out=tfplan
 
+      # 10. Destroy infrastructure
       - name: Terraform Destroy
         if: inputs.action == 'destroy'
-        run: |
-          terraform plan -destroy -input=false
-          terraform destroy -input=false -auto-approve
+        run: terraform apply -input=false -lock-timeout=5m -auto-approve tfplan
+
+      # 11. Show final Terraform state
+      - name: Show Terraform State
+        if: always() && steps.init.outcome == 'success'
+        run: terraform state list
+        continue-on-error: true
+        id: state
