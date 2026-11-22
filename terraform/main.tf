@@ -54,7 +54,6 @@ resource "aws_instance" "node" {
   for_each               = toset(var.nodes)
   ami                    = data.aws_ssm_parameter.ubuntu.value
   instance_type          = var.instance_type
-  key_name               = var.key_name
   vpc_security_group_ids = [aws_security_group.k8s.id]
 
   root_block_device {
